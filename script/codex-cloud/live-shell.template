@@ -1,0 +1,103 @@
+import { LanguageModel, LLMClient } from "@opencode/ai"
+import { OpenAIChat } from "@opencode/ai/protocols"
+import { TestLLM } from "@opencode/ai/testing"
+import { llmClient } from "@opencode/core/effect/app-node-platform"
+import { SessionRunnerModel } from "@opencode/core/session/runner/model"
+import { Global } from "@opencode/util/global"
+import { base64Encode } from "@opencode/util/encode"
+import { Effect, Layer } from "effect"
+import { mkdtemp, mkdir, stat } from "node:fs/promises"
+import path from "node:path"
+import { ServerFetch } from "../server/src/fetch"
+import { chromium, expect } from "../app/node_modules/@playwright/test"
+
+const mode = process.env.CLOUD_SHELL_MODE ?? "after"
+const evidence = path.resolve("cloud-evidence")
+const dist = path.resolve("packages/app/dist")
+const base = "http://127.0.0.1:4310"
+const model = SessionRunnerModel.resolved(
+  LanguageModel.make({ id: "cloud-model", provider: "test", route: OpenAIChat.route }),
+  { capabilities: { tools: true, input: ["text"], output: ["text"] }, cost: [], limit: { context: 200000, output: 8192 } },
+)
+
+await Effect.gen(function* () {
+  const directory = yield* Effect.promise(() => mkdtemp("/tmp/opencode-shell-cloud-"))
+  yield* Effect.promise(() => mkdir(evidence, { recursive: true }))
+  const llm = yield* TestLLM.Test.pipe(Effect.provide(TestLLM.testLayer()))
+  let launched = false
+  yield* llm.serve((request) => {
+    console.log("SIMULATED_MODEL_REQUEST", request.tools.map((tool) => tool.name))
+    if (!launched && request.tools.some((tool) => tool.name === "shell")) {
+      launched = true
+      return TestLLM.tool("call_cloud_background_shell", "shell", { command: "sleep 600", background: true })
+    }
+    return TestLLM.text("Background command acknowledged.", "cloud-answer")
+  })
+  const global = Global.layerWith({
+    data: path.join(directory, "data"), cache: path.join(directory, "cache"), config: path.join(directory, "config"),
+    state: path.join(directory, "state"), tmp: path.join(directory, "tmp"), bin: path.join(directory, "bin"),
+    log: path.join(directory, "log"), repos: path.join(directory, "repos"),
+  })
+  const handler = yield* ServerFetch.make({
+    app: { name: "cloud-shell-evidence", version: "2.1.3", channel: "dev" },
+    database: { path: path.join(directory, "sessions.db") },
+    config: { directory, project: false, content: "{}" },
+    models: { fetch: false }, fs: { filewatcher: false, fff: false }, events: { persist: true },
+  }, { overrides: [
+    Global.node.replace(global),
+    llmClient.replace(Layer.succeed(LLMClient.Service, llm)),
+    SessionRunnerModel.node.replace(Layer.succeed(SessionRunnerModel.Service, { resolve: () => Effect.succeed(model) })),
+  ] })
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 4310, async fetch(request) {
+    const url = new URL(request.url)
+    if (url.pathname.startsWith("/api/")) return handler(request)
+    const target = path.resolve(dist, `.${decodeURIComponent(url.pathname)}`)
+    const found = target.startsWith(dist + path.sep) ? await stat(target).catch(() => undefined) : undefined
+    if (found?.isFile()) return new Response(Bun.file(target))
+    return new Response(Bun.file(path.join(dist, "index.html")), { headers: { "content-type": "text/html" } })
+  } })
+  yield* Effect.addFinalizer(() => Effect.promise(() => server.stop(true)))
+  yield* Effect.promise(async () => {
+    const api = async (route: string, method = "GET", payload?: unknown) => {
+      const response = await fetch(`${base}${route}`, { method, headers: { "content-type": "application/json" }, body: payload === undefined ? undefined : JSON.stringify(payload) })
+      if (!response.ok) throw new Error(`${method} ${route}: ${response.status} ${await response.text()}`)
+      return response.status === 204 ? undefined : response.json()
+    }
+    const created = await api("/api/session", "POST", { title: "Cloud shell teardown reproduction", location: { directory }, model: model.ref, permissions: [{ action: "*", resource: "*", effect: "allow" }] })
+    const id = created.data.id
+    const browser = await chromium.launch({ headless: true })
+    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, recordVideo: { dir: path.join(evidence, `${mode}-video`) } })
+    const page = await context.newPage()
+    page.on("pageerror", (error) => console.error("BROWSER_ERROR", error.message))
+    try {
+      await page.goto(`${base}/server/${base64Encode(base)}/session/${id}`)
+      await expect(page.getByRole("heading", { name: "Cloud shell teardown reproduction", exact: true })).toBeVisible({ timeout: 30000 })
+      await api(`/api/session/${id}/prompt`, "POST", { text: "Start the background shell now." })
+      await expect(page.getByRole("button", { name: "1 running", exact: true })).toBeVisible({ timeout: 30000 })
+      await page.screenshot({ path: path.join(evidence, `${mode}-running.png`) })
+      const before = await api(`/api/shell?location[directory]=${encodeURIComponent(directory)}`)
+      await Bun.write(path.join(evidence, `${mode}-shells-before.json`), JSON.stringify(before, null, 2))
+      await api(`/api/debug/location?location[directory]=${encodeURIComponent(directory)}`, "DELETE")
+      try {
+        await expect(page.getByRole("button", { name: "1 running", exact: true })).toHaveCount(0, { timeout: 12000 })
+      } catch (error) {
+        await page.screenshot({ path: path.join(evidence, `${mode}-stale-running.png`) })
+        const messages = await api(`/api/session/${id}/message`)
+        const shells = await api(`/api/shell?location[directory]=${encodeURIComponent(directory)}`)
+        await Bun.write(path.join(evidence, `${mode}-result.json`), JSON.stringify({ outcome: "stale-running-row", messages, shells }, null, 2))
+        throw error
+      }
+      await expect.poll(async () => {
+        const messages = await api(`/api/session/${id}/message`)
+        return messages.data.some((message) => message.type === "synthetic" && message.metadata?.source === "shell" && message.metadata?.state === "cancelled")
+      }, { timeout: 15000 }).toBe(true)
+      const messages = await api(`/api/session/${id}/message`)
+      const shells = await api(`/api/shell?location[directory]=${encodeURIComponent(directory)}`)
+      await Bun.write(path.join(evidence, `${mode}-result.json`), JSON.stringify({ outcome: "cleared-with-cancellation-notice", messages, shells }, null, 2))
+      await page.screenshot({ path: path.join(evidence, `${mode}-cleared.png`) })
+    } finally {
+      await context.close()
+      await browser.close()
+    }
+  })
+}).pipe(Effect.scoped, Effect.runPromise)

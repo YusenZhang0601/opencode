@@ -1,0 +1,74 @@
+name: Shell teardown cloud evidence
+on:
+  push:
+    branches: [shell-cloud-evidence]
+permissions:
+  contents: read
+jobs:
+  reproduce-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
+      - name: Install locked dependencies
+        run: |
+          mkdir -p cloud-evidence
+          bun install --frozen-lockfile --ignore-scripts
+          bun run --cwd packages/core fix-node-pty
+      - name: Check production source
+        run: |
+          bun run check > cloud-evidence/check.log 2>&1
+          bun run --cwd packages/core typecheck:tsc > cloud-evidence/core-tsc.log 2>&1
+          bunx --no-install prettier --check packages/core/src/session/shell-job.ts packages/core/src/plugin/internal.ts packages/core/src/shell/result.ts packages/core/src/tool/plugin/shell.ts packages/core/test/tool-shell.test.ts
+      - name: Reproduce missing notification on original PR
+        shell: bash
+        run: |
+          git restore --source=a45cef71a13209b893d2228a587222f8ad0db575 -- packages/core/src/tool/plugin/shell.ts
+          set +e
+          (cd packages/core && bun run script/test.ts test/tool-shell.test.ts --test-name-pattern 'notifies the session when a background shell location is torn down') > cloud-evidence/core-before.log 2>&1
+          result=$?
+          set -e
+          git restore --source=HEAD -- packages/core/src/tool/plugin/shell.ts
+          test "$result" -ne 0
+          rg 'Operation timed out' cloud-evidence/core-before.log
+      - name: Verify updated lifetime
+        run: |
+          (cd packages/core && bun run script/test.ts test/tool-shell.test.ts --test-name-pattern 'notifies the session when a background shell location is torn down' --rerun-each 10) > cloud-evidence/core-after.log 2>&1
+          (cd packages/core && bun run script/test.ts test/tool-shell.test.ts test/shell-retention.test.ts test/job.test.ts) > cloud-evidence/related.log 2>&1
+      - name: Prepare real web app and Chromium
+        run: |
+          bun --cwd packages/app run build > cloud-evidence/web-build.log 2>&1
+          (cd packages/app && bunx playwright install --with-deps chromium)
+          cp script/codex-cloud/live-shell.template packages/sdk/cloud-live-shell.ts
+      - name: Reproduce original PR in real browser
+        shell: bash
+        run: |
+          git restore --source=a45cef71a13209b893d2228a587222f8ad0db575 -- packages/core/src/tool/plugin/shell.ts
+          set +e
+          CLOUD_SHELL_MODE=before bun packages/sdk/cloud-live-shell.ts > cloud-evidence/web-before.log 2>&1
+          result=$?
+          set -e
+          git restore --source=HEAD -- packages/core/src/tool/plugin/shell.ts
+          test "$result" -ne 0
+          test -f cloud-evidence/before-stale-running.png
+          test -f cloud-evidence/before-result.json
+      - name: Verify updated PR in real browser
+        run: CLOUD_SHELL_MODE=after bun packages/sdk/cloud-live-shell.ts > cloud-evidence/web-after.log 2>&1
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: shell-teardown-cloud-evidence
+          path: cloud-evidence/
+          retention-days: 14
