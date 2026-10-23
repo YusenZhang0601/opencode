@@ -38,7 +38,7 @@ jobs:
           set -e
           git restore --source=HEAD -- packages/core/src/tool/plugin/shell.ts
           test "$result" -ne 0
-          rg 'Operation timed out' cloud-evidence/core-before.log
+          grep -q 'Operation timed out' cloud-evidence/core-before.log
       - name: Verify updated lifetime
         run: |
           (cd packages/core && bun run script/test.ts test/tool-shell.test.ts --test-name-pattern 'notifies the session when a background shell location is torn down' --rerun-each 10) > cloud-evidence/core-after.log 2>&1
