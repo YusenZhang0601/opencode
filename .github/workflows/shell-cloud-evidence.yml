@@ -15,6 +15,8 @@ jobs:
         with:
           fetch-depth: 2
           persist-credentials: false
+      - name: Fetch exact original PR baseline
+        run: git fetch --no-tags --depth=1 origin a45cef71a13209b893d2228a587222f8ad0db575
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
@@ -26,11 +28,6 @@ jobs:
           mkdir -p cloud-evidence
           bun install --frozen-lockfile --ignore-scripts
           bun run --cwd packages/core fix-node-pty
-      - name: Check production source
-        run: |
-          bun run check > cloud-evidence/check.log 2>&1
-          bun run --cwd packages/core typecheck:tsc > cloud-evidence/core-tsc.log 2>&1
-          bunx --no-install prettier --check packages/core/src/session/shell-job.ts packages/core/src/plugin/internal.ts packages/core/src/shell/result.ts packages/core/src/tool/plugin/shell.ts packages/core/test/tool-shell.test.ts
       - name: Reproduce missing notification on original PR
         shell: bash
         run: |
@@ -46,6 +43,11 @@ jobs:
         run: |
           (cd packages/core && bun run script/test.ts test/tool-shell.test.ts --test-name-pattern 'notifies the session when a background shell location is torn down' --rerun-each 10) > cloud-evidence/core-after.log 2>&1
           (cd packages/core && bun run script/test.ts test/tool-shell.test.ts test/shell-retention.test.ts test/job.test.ts) > cloud-evidence/related.log 2>&1
+      - name: Check production source
+        run: |
+          bun run check > cloud-evidence/check.log 2>&1
+          bun run --cwd packages/core typecheck:tsc > cloud-evidence/core-tsc.log 2>&1
+          bunx --no-install prettier --check packages/core/src/session/shell-job.ts packages/core/src/plugin/internal.ts packages/core/src/shell/result.ts packages/core/src/tool/plugin/shell.ts packages/core/test/tool-shell.test.ts
       - name: Prepare real web app and Chromium
         run: |
           bun --cwd packages/app run build > cloud-evidence/web-build.log 2>&1

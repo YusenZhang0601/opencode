@@ -23,7 +23,10 @@ const make = Effect.gen(function* () {
   const context = yield* Effect.context<never>()
 
   return Service.of({
-    notify: Effect.fn("ShellJob.notify")(function* (recovery: Recovery, settled: Deferred.Deferred<ShellResult.Output>) {
+    notify: Effect.fn("ShellJob.notify")(function* (
+      recovery: Recovery,
+      settled: Deferred.Deferred<ShellResult.Output>,
+    ) {
       yield* Effect.gen(function* () {
         const info = (yield* jobs.wait({ id: recovery.shellID })).info
         if (!info || info.status === "running") return
