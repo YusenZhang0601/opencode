@@ -1319,6 +1319,7 @@ describe("ShellTool", () => {
             Permission.node,
             Session.node,
             Job.node,
+            ShellJob.node,
             Shell.node,
             ShellSelect.node,
             Tool.node,
