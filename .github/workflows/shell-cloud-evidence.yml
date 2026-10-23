@@ -50,7 +50,8 @@ jobs:
           bunx --no-install prettier --check packages/core/src/session/shell-job.ts packages/core/src/plugin/internal.ts packages/core/src/shell/result.ts packages/core/src/tool/plugin/shell.ts packages/core/test/tool-shell.test.ts
       - name: Prepare real web app and Chromium
         run: |
-          bun --cwd packages/app run build > cloud-evidence/web-build.log 2>&1
+          bun run --cwd packages/app build > cloud-evidence/web-build.log 2>&1
+          test -s packages/app/dist/index.html
           (cd packages/app && bunx playwright install --with-deps chromium)
           cp script/codex-cloud/live-shell.template packages/sdk/cloud-live-shell.ts
       - name: Reproduce original PR in real browser
